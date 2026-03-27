@@ -2,14 +2,15 @@
 #include "authsessionmanager.h"
 
 #include <QDebug>
+#include <unistd.h>  // getpid()
 
-// Pull in GLib/Polkit — isolated to this translation unit only
+// GLib/Polkit — isolated to this translation unit only.
 #include <polkit/polkit.h>
 #include <polkitagent/polkitagent.h>
+#include <gio/gio.h>
 
 // ── GObject subclass of PolkitAgentListener ───────────────────────────────
-// We need a real GObject subtype because PolkitAgentListener is abstract GObject.
-// Keep all Qt logic in SlmPolkitAgent; this struct is the minimal GLib glue.
+// Minimal C/GLib glue. All business logic lives in AuthSessionManager (Qt).
 
 struct SlmListenerPrivate {
     AuthSessionManager *manager = nullptr;
@@ -37,6 +38,7 @@ static void slm_listener_initiate_authentication(
     GAsyncReadyCallback   callback,
     gpointer              user_data)
 {
+    Q_UNUSED(details)
     SlmListener *self = SLM_LISTENER(listener);
     self->priv->manager->initiateAuthentication(
         QString::fromUtf8(action_id),
@@ -45,7 +47,7 @@ static void slm_listener_initiate_authentication(
         QString::fromUtf8(cookie),
         identities,
         cancellable,
-        callback,
+        reinterpret_cast<void *>(callback),
         user_data);
 }
 
@@ -55,14 +57,25 @@ static gboolean slm_listener_initiate_authentication_finish(
     GError              **error)
 {
     Q_UNUSED(listener)
-    return g_simple_async_result_propagate_error(G_SIMPLE_ASYNC_RESULT(res), error) == FALSE;
+    // res is a GTask created by AuthSession or AuthSessionManager.
+    return g_task_propagate_boolean(G_TASK(res), error);
+}
+
+static void slm_listener_finalize(GObject *object)
+{
+    SlmListener *self = SLM_LISTENER(object);
+    delete self->priv;
+    self->priv = nullptr;
+    G_OBJECT_CLASS(slm_listener_parent_class)->finalize(object);
 }
 
 static void slm_listener_class_init(SlmListenerClass *klass)
 {
-    PolkitAgentListenerClass *listener_class = POLKIT_AGENT_LISTENER_CLASS(klass);
-    listener_class->initiate_authentication        = slm_listener_initiate_authentication;
-    listener_class->initiate_authentication_finish = slm_listener_initiate_authentication_finish;
+    G_OBJECT_CLASS(klass)->finalize = slm_listener_finalize;
+
+    PolkitAgentListenerClass *lc = POLKIT_AGENT_LISTENER_CLASS(klass);
+    lc->initiate_authentication        = slm_listener_initiate_authentication;
+    lc->initiate_authentication_finish = slm_listener_initiate_authentication_finish;
 }
 
 static void slm_listener_init(SlmListener *self)
@@ -88,36 +101,45 @@ bool SlmPolkitAgent::registerAgent()
     listener->priv->manager = m_manager;
     m_listener = POLKIT_AGENT_LISTENER(listener);
 
-    // Register for the current Unix session
+    // Prefer XDG_SESSION_ID (systemd/logind) — faster and more reliable than
+    // the _sync variant which talks to logind over D-Bus.
     GError *error = nullptr;
-    PolkitSubject *subject = polkit_unix_session_new_for_process_sync(
-        getpid(), nullptr, &error);
-    if (!subject) {
-        qCritical() << "Failed to get session subject:" << (error ? error->message : "unknown");
-        if (error) g_error_free(error);
-        g_object_unref(m_listener);
-        m_listener = nullptr;
-        return false;
+    PolkitSubject *subject = nullptr;
+
+    const QByteArray sessionId = qgetenv("XDG_SESSION_ID");
+    if (!sessionId.isEmpty()) {
+        subject = polkit_unix_session_new(sessionId.constData());
+    } else {
+        subject = polkit_unix_session_new_for_process_sync(getpid(), nullptr, &error);
+        if (!subject) {
+            qCritical() << "Failed to determine session subject:"
+                        << (error ? error->message : "unknown");
+            if (error) g_error_free(error);
+            g_object_unref(m_listener);
+            m_listener = nullptr;
+            return false;
+        }
     }
 
     m_registeredAgent = polkit_agent_listener_register(
         m_listener,
         POLKIT_AGENT_REGISTER_FLAGS_NONE,
         subject,
-        nullptr, // object_path — use default
+        nullptr, // object_path — use polkit default
         nullptr, // cancellable
         &error);
     g_object_unref(subject);
 
     if (!m_registeredAgent) {
-        qCritical() << "Failed to register polkit agent:" << (error ? error->message : "unknown");
+        qCritical() << "Failed to register polkit agent:"
+                    << (error ? error->message : "unknown");
         if (error) g_error_free(error);
         g_object_unref(m_listener);
         m_listener = nullptr;
         return false;
     }
 
-    qDebug() << "slm-polkit-agent registered successfully";
+    qInfo("slm-polkit-agent registered successfully.");
     return true;
 }
 

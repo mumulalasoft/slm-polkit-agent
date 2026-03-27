@@ -2,176 +2,191 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 
-// AuthDialog — root window for the polkit authentication agent.
+// AuthDialog — system authentication dialog for the polkit agent.
+//
+// Uses a fullscreen transparent window on Wayland (no nested Window objects —
+// Wayland does not support absolute screen positioning for child windows).
+// The dim layer fills the whole screen; the dialog card is centered on it.
 //
 // Driven by AuthDialogController (C++ context property "AuthDialog").
-// Appears as a floating system dialog above all other windows.
-// Invisible when AuthDialog.visible == false.
 
 Window {
     id: root
-    flags: Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool
-    color: "transparent"
-    width: 360
-    height: dialogSurface.implicitHeight + 40 // shadow margin
-    visible: AuthDialog.visible
 
-    // Center on screen
-    Component.onCompleted: {
-        x = Screen.width  / 2 - width  / 2
-        y = Screen.height / 2 - height / 2
-    }
+    // Fullscreen transparent window — works on both Wayland and X11.
+    // On Wayland, Qt maps this to xdg_toplevel with fullscreen state.
+    flags:      Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+    color:      "transparent"
+    visibility: AuthDialog.visible ? Window.FullScreen : Window.Hidden
+    visible:    AuthDialog.visible
 
-    // Dim the background (full-screen overlay on primary screen)
-    Window {
-        id: dimOverlay
-        flags: Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool
-        color: Qt.rgba(0, 0, 0, 0.45)
-        x: 0; y: 0
-        width: Screen.width; height: Screen.height
-        visible: AuthDialog.visible
-
-        Behavior on opacity { NumberAnimation { duration: 180 } }
-
-        MouseArea {
-            anchors.fill: parent
-            // Absorb clicks on the overlay (do not dismiss dialog)
+    // Clear password field whenever the dialog is hidden.
+    // This prevents a stale password from being visible if the dialog re-opens.
+    Connections {
+        target: AuthDialog
+        function onVisibleChanged() {
+            if (!AuthDialog.visible)
+                passwordField.clear()
         }
     }
 
-    // Entrance animation
-    NumberAnimation on opacity {
-        from: 0; to: 1
-        duration: 200
-        running: AuthDialog.visible
-    }
+    // Fade in on show
+    opacity: 0
+    Behavior on opacity { NumberAnimation { duration: 180; easing.type: Easing.OutQuad } }
+    onVisibleChanged: opacity = visible ? 1 : 0
 
-    // ── Dialog surface ──────────────────────────────────────────────────
-    Rectangle {
-        id: dialogSurface
-        anchors.centerIn: parent
-        width: 320
-        implicitHeight: content.implicitHeight + 48
-        radius: 16
-        color: Qt.rgba(0.13, 0.13, 0.15, 0.96)
-        border.width: 1
-        border.color: Qt.rgba(1, 1, 1, 0.10)
+    // ── Full-screen content ─────────────────────────────────────────────
+    Item {
+        anchors.fill: parent
 
-        // Drop shadow
-        layer.enabled: true
-        layer.effect: null // replace with MultiEffect shadow when Qt 6.5+ available
+        // Dim layer — absorbs all pointer input outside the dialog card
+        Rectangle {
+            anchors.fill: parent
+            color: Qt.rgba(0, 0, 0, 0.48)
 
-        ColumnLayout {
-            id: content
-            anchors {
-                left: parent.left; right: parent.right
-                top: parent.top
-                margins: 24
+            MouseArea {
+                anchors.fill: parent
+                // Intentionally absorb clicks — auth dialogs must not be
+                // dismissed by clicking outside. User must Cancel explicitly.
             }
-            spacing: 16
+        }
 
-            // Identity + message header
-            AuthIdentityView {
-                Layout.fillWidth: true
-                iconName: AuthDialog.iconName
-                message:  AuthDialog.message
-                identity: AuthDialog.identity
-            }
+        // ── Dialog card ────────────────────────────────────────────────
+        Rectangle {
+            id: dialogCard
+            anchors.centerIn: parent
+            width: 320
+            height: content.implicitHeight + 48
+            radius: 16
+            color: Qt.rgba(0.12, 0.12, 0.14, 0.97)
+            border.width: 1
+            border.color: Qt.rgba(1, 1, 1, 0.09)
 
-            // Error / info text
-            Text {
-                Layout.fillWidth: true
-                text: AuthDialog.errorText || AuthDialog.infoText
-                color: AuthDialog.errorText ? "#e07070" : Qt.rgba(1, 1, 1, 0.55)
-                font.pixelSize: 12
-                wrapMode: Text.WordWrap
-                horizontalAlignment: Text.AlignHCenter
-                visible: text.length > 0
-            }
-
-            // Password field
-            PasswordField {
-                id: passwordField
-                Layout.fillWidth: true
-                hasError: AuthDialog.errorText.length > 0
-                enabled: !AuthDialog.loading
-
-                onSubmitted: function(password) {
-                    AuthDialog.submitPassword(password)
+            // Subtle inner glow on top edge
+            Rectangle {
+                anchors {
+                    top: parent.top; left: parent.left; right: parent.right
+                    topMargin: 1; leftMargin: 1; rightMargin: 1
                 }
-
-                // Shake on error
-                onHasErrorChanged: {
-                    if (hasError) shake()
-                }
+                height: 1
+                color: Qt.rgba(1, 1, 1, 0.08)
+                radius: parent.radius
             }
 
-            // Loading indicator (replaces password field when authenticating)
-            Item {
-                Layout.fillWidth: true
-                height: 20
-                visible: AuthDialog.loading
-
-                BusyIndicator {
-                    anchors.centerIn: parent
-                    running: AuthDialog.loading
-                    palette.dark: Qt.rgba(1, 1, 1, 0.7)
-                    width: 20; height: 20
+            ColumnLayout {
+                id: content
+                anchors {
+                    left: parent.left; right: parent.right
+                    top: parent.top; margins: 24
                 }
-            }
+                spacing: 16
 
-            // Action buttons
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: 10
-
-                // Cancel
-                Button {
+                // ── Header: icon + message + identity ──────────────────
+                AuthIdentityView {
                     Layout.fillWidth: true
-                    text: qsTr("Cancel")
+                    iconName: AuthDialog.iconName
+                    message:  AuthDialog.message
+                    identity: AuthDialog.identity
+                }
+
+                // ── Error / info banner ────────────────────────────────
+                Text {
+                    Layout.fillWidth: true
+                    text: AuthDialog.errorText || AuthDialog.infoText
+                    color: AuthDialog.errorText.length > 0
+                        ? "#e07070"
+                        : Qt.rgba(1, 1, 1, 0.5)
+                    font.pixelSize: 12
+                    wrapMode: Text.WordWrap
+                    horizontalAlignment: Text.AlignHCenter
+                    visible: text.length > 0
+                }
+
+                // ── Password input ─────────────────────────────────────
+                PasswordField {
+                    id: passwordField
+                    Layout.fillWidth: true
                     enabled: !AuthDialog.loading
-                    onClicked: AuthDialog.requestCancel()
+                    hasError: AuthDialog.errorText.length > 0
 
-                    background: Rectangle {
-                        radius: 8
-                        color: parent.hovered ? Qt.rgba(1,1,1,0.12) : Qt.rgba(1,1,1,0.07)
-                        Behavior on color { ColorAnimation { duration: 100 } }
+                    onSubmitted: function(password) {
+                        AuthDialog.submitPassword(password)
                     }
-                    contentItem: Text {
-                        text: parent.text
-                        color: "white"
-                        font.pixelSize: 13
-                        horizontalAlignment: Text.AlignHCenter
+
+                    onHasErrorChanged: {
+                        if (hasError) shake()
                     }
                 }
 
-                // Authenticate
-                Button {
+                // ── Loading state ──────────────────────────────────────
+                Item {
                     Layout.fillWidth: true
-                    text: qsTr("Authenticate")
-                    enabled: !AuthDialog.loading && passwordField.text.length > 0
-                    onClicked: AuthDialog.submitPassword(passwordField.text)
+                    implicitHeight: 24
+                    visible: AuthDialog.loading
 
-                    background: Rectangle {
-                        radius: 8
-                        color: parent.enabled
-                            ? (parent.hovered ? Qt.rgba(0.3, 0.55, 0.9, 1)
-                                              : Qt.rgba(0.25, 0.48, 0.85, 1))
-                            : Qt.rgba(1,1,1,0.08)
-                        Behavior on color { ColorAnimation { duration: 100 } }
-                    }
-                    contentItem: Text {
-                        text: parent.text
-                        color: parent.enabled ? "white" : Qt.rgba(1,1,1,0.3)
-                        font.pixelSize: 13
-                        font.weight: Font.Medium
-                        horizontalAlignment: Text.AlignHCenter
+                    BusyIndicator {
+                        anchors.centerIn: parent
+                        running: AuthDialog.loading
+                        width: 22; height: 22
+                        palette.dark: Qt.rgba(1, 1, 1, 0.65)
                     }
                 }
-            }
 
-            // Bottom spacer
-            Item { height: 0 }
+                // ── Action buttons ─────────────────────────────────────
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+
+                    Button {
+                        Layout.fillWidth: true
+                        text: qsTr("Cancel")
+                        enabled: !AuthDialog.loading
+                        onClicked: AuthDialog.requestCancel()
+
+                        background: Rectangle {
+                            radius: 8
+                            color: parent.hovered
+                                ? Qt.rgba(1, 1, 1, 0.12)
+                                : Qt.rgba(1, 1, 1, 0.07)
+                            Behavior on color { ColorAnimation { duration: 100 } }
+                        }
+                        contentItem: Text {
+                            text: parent.text
+                            color: "white"
+                            font.pixelSize: 13
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                    }
+
+                    Button {
+                        Layout.fillWidth: true
+                        text: qsTr("Authenticate")
+                        enabled: !AuthDialog.loading && passwordField.text.length > 0
+                        onClicked: AuthDialog.submitPassword(passwordField.text)
+
+                        background: Rectangle {
+                            radius: 8
+                            color: parent.enabled
+                                ? (parent.hovered
+                                    ? Qt.rgba(0.30, 0.55, 0.92, 1)
+                                    : Qt.rgba(0.24, 0.48, 0.86, 1))
+                                : Qt.rgba(1, 1, 1, 0.07)
+                            Behavior on color { ColorAnimation { duration: 100 } }
+                        }
+                        contentItem: Text {
+                            text: parent.text
+                            color: parent.enabled ? "white" : Qt.rgba(1, 1, 1, 0.25)
+                            font.pixelSize: 13
+                            font.weight: Font.Medium
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                    }
+                }
+
+                Item { implicitHeight: 0 } // bottom padding inside margins
+            }
         }
     }
 }

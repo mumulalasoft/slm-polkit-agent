@@ -2,7 +2,9 @@ import QtQuick
 import QtQuick.Controls
 
 // PasswordField — password input with shake-on-error animation.
-// Exposes text property and submitPassword() signal.
+//
+// Uses a Translate transform for the shake so it doesn't conflict with
+// parent layout managers (ColumnLayout, etc.) that control the x property.
 
 Item {
     id: root
@@ -22,15 +24,18 @@ Item {
         field.text = ""
     }
 
-    // Shake animation on wrong password
+    // Translate transform — layout-safe, does not conflict with managed x
+    transform: Translate { id: shiftT; x: 0 }
+
     SequentialAnimation {
         id: shakeAnim
         loops: 1
-        PropertyAnimation { target: root; property: "x"; to: root.x + 6;  duration: 40 }
-        PropertyAnimation { target: root; property: "x"; to: root.x - 6;  duration: 40 }
-        PropertyAnimation { target: root; property: "x"; to: root.x + 4;  duration: 40 }
-        PropertyAnimation { target: root; property: "x"; to: root.x - 4;  duration: 40 }
-        PropertyAnimation { target: root; property: "x"; to: root.x;      duration: 40 }
+        PropertyAnimation { target: shiftT; property: "x"; to:  7; duration: 45; easing.type: Easing.OutQuad }
+        PropertyAnimation { target: shiftT; property: "x"; to: -7; duration: 45; easing.type: Easing.InOutQuad }
+        PropertyAnimation { target: shiftT; property: "x"; to:  5; duration: 40; easing.type: Easing.InOutQuad }
+        PropertyAnimation { target: shiftT; property: "x"; to: -5; duration: 40; easing.type: Easing.InOutQuad }
+        PropertyAnimation { target: shiftT; property: "x"; to:  2; duration: 35; easing.type: Easing.InOutQuad }
+        PropertyAnimation { target: shiftT; property: "x"; to:  0; duration: 35; easing.type: Easing.InQuad }
     }
 
     TextField {

@@ -1,14 +1,13 @@
 #include "authsession.h"
 
 #include <QDebug>
-#include <cstring>
 
 #include <polkit/polkit.h>
 #include <polkitagent/polkitagent.h>
 #include <gio/gio.h>
 
 AuthSession::AuthSession(const QString &cookie,
-                         void          *polkitIdentity,
+                         void          *identity,
                          GCancellable  *cancellable,
                          void          *asyncCallback,
                          void          *asyncUserData,
@@ -19,9 +18,8 @@ AuthSession::AuthSession(const QString &cookie,
     , m_asyncCallback(asyncCallback)
     , m_asyncUserData(asyncUserData)
 {
-    m_session = polkit_agent_session_new(
-        POLKIT_IDENTITY(polkitIdentity), cookie.toUtf8().constData());
-
+    m_session = polkit_agent_session_new(POLKIT_IDENTITY(identity),
+                                         cookie.toUtf8().constData());
     g_signal_connect(m_session, "request",    G_CALLBACK(onRequest),    this);
     g_signal_connect(m_session, "show-error", G_CALLBACK(onShowError),  this);
     g_signal_connect(m_session, "show-info",  G_CALLBACK(onShowInfo),   this);
@@ -31,6 +29,9 @@ AuthSession::AuthSession(const QString &cookie,
 AuthSession::~AuthSession()
 {
     if (m_session) {
+        // Disconnect ALL GLib signals pointing to this object before unref.
+        // Without this, a late-firing signal would dereference a dead pointer.
+        g_signal_handlers_disconnect_by_data(m_session, this);
         g_object_unref(m_session);
         m_session = nullptr;
     }
@@ -51,66 +52,71 @@ void AuthSession::respond(const QString &password)
 {
     if (m_state != State::Authenticating) return;
 
+    // Copy to QByteArray, respond, then zero — minimize time password is in memory.
     QByteArray buf = password.toUtf8();
     polkit_agent_session_response(m_session, buf.constData());
-
-    // Zero the buffer immediately — minimize time sensitive data is in memory
     buf.fill('\0');
+    // Note: the original QString arg and QML's TextField.text are not zeroable from C++.
+    // This is a known limitation of Qt string handling in authentication flows.
 }
 
 void AuthSession::cancel()
 {
     if (m_state == State::Completed || m_state == State::Cancelled) return;
     m_state = State::Cancelled;
+
     polkit_agent_session_cancel(m_session);
+    // polkit_agent_session_cancel may asynchronously fire "completed" — the state
+    // guard in onCompleted() ensures we don't process it twice.
 
-    // Complete the GAsync result so the polkit caller gets a response
-    GSimpleAsyncResult *result = g_simple_async_result_new(
-        nullptr, reinterpret_cast<GAsyncReadyCallback>(m_asyncCallback),
-        m_asyncUserData, nullptr);
-    g_simple_async_result_set_error(result, POLKIT_ERROR,
-                                    POLKIT_ERROR_CANCELLED, "Cancelled by user");
-    g_simple_async_result_complete(result);
-    g_object_unref(result);
-
+    completeTask(false, "Cancelled by user");
     emit completed(false);
 }
 
-// ── GLib signal callbacks ─────────────────────────────────────────────────
+// ── Private: GTask completion ─────────────────────────────────────────────
 
-void AuthSession::onRequest(PolkitAgentSession *, const char *request, gboolean echoOn, void *userData)
+void AuthSession::completeTask(bool success, const char *errorMsg)
 {
-    Q_UNUSED(request); Q_UNUSED(echoOn)
-    // polkit is asking for the password — forward to UI
-    emit reinterpret_cast<AuthSession *>(userData)->requestPassword();
-}
-
-void AuthSession::onShowError(PolkitAgentSession *, const char *text, void *userData)
-{
-    emit reinterpret_cast<AuthSession *>(userData)->showError(QString::fromUtf8(text));
-}
-
-void AuthSession::onShowInfo(PolkitAgentSession *, const char *text, void *userData)
-{
-    emit reinterpret_cast<AuthSession *>(userData)->showInfo(QString::fromUtf8(text));
-}
-
-void AuthSession::onCompleted(PolkitAgentSession *, gboolean gainedAuth, void *userData)
-{
-    auto *self = reinterpret_cast<AuthSession *>(userData);
-    self->m_state = gainedAuth ? State::Completed : State::Failed;
-
-    GSimpleAsyncResult *result = g_simple_async_result_new(
-        nullptr,
-        reinterpret_cast<GAsyncReadyCallback>(self->m_asyncCallback),
-        self->m_asyncUserData,
-        nullptr);
-    if (!gainedAuth) {
-        g_simple_async_result_set_error(result, POLKIT_ERROR,
-                                        POLKIT_ERROR_FAILED, "Authentication failed");
+    GTask *task = g_task_new(nullptr, m_cancellable,
+                             reinterpret_cast<GAsyncReadyCallback>(m_asyncCallback),
+                             m_asyncUserData);
+    if (success) {
+        g_task_return_boolean(task, TRUE);
+    } else {
+        g_task_return_error(task,
+            g_error_new(POLKIT_ERROR, POLKIT_ERROR_FAILED,
+                        "%s", errorMsg ? errorMsg : "Authentication failed"));
     }
-    g_simple_async_result_complete(result);
-    g_object_unref(result);
+    g_object_unref(task);
+}
 
+// ── GLib signal callbacks — run on Qt main thread via QEventDispatcherGlib ─
+
+void AuthSession::onRequest(PolkitAgentSession *, const char * /*req*/, gboolean /*echo*/, void *ud)
+{
+    // polkit PAM helper is requesting a password (or other input).
+    // We always treat it as a password prompt — echo=false is the normal case.
+    emit reinterpret_cast<AuthSession *>(ud)->requestPassword();
+}
+
+void AuthSession::onShowError(PolkitAgentSession *, const char *text, void *ud)
+{
+    emit reinterpret_cast<AuthSession *>(ud)->showError(QString::fromUtf8(text));
+}
+
+void AuthSession::onShowInfo(PolkitAgentSession *, const char *text, void *ud)
+{
+    emit reinterpret_cast<AuthSession *>(ud)->showInfo(QString::fromUtf8(text));
+}
+
+void AuthSession::onCompleted(PolkitAgentSession *, gboolean gainedAuth, void *ud)
+{
+    auto *self = reinterpret_cast<AuthSession *>(ud);
+
+    // Guard: cancel() already called completeTask + emitted completed(false).
+    if (self->m_state == State::Cancelled) return;
+
+    self->m_state = gainedAuth ? State::Completed : State::Failed;
+    self->completeTask(gainedAuth);
     emit self->completed(gainedAuth);
 }

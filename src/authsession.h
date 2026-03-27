@@ -2,18 +2,21 @@
 #include <QObject>
 #include <QString>
 
-// GLib forward declarations
 typedef struct _PolkitAgentSession PolkitAgentSession;
 typedef struct _GCancellable       GCancellable;
-typedef struct _GAsyncReadyCallback GAsyncReadyCallback; // not a struct, but avoids include
-typedef void (*GAsyncReadyCallback_t)(void*, void*, void*);
 
 // AuthSession — wraps one PolkitAgentSession (a single authentication attempt).
 //
-// State machine:
-//   Idle → Authenticating → Completed / Failed / Cancelled
+// Lifecycle:
+//   1. Construct with cookie + identity (GObject, caller retains ownership)
+//   2. Call start() — polkit initiates PAM conversation
+//   3. On requestPassword(): call respond(password) — password zeroed internally
+//   4. On completed(gainedAuth): session is done, delete this object
 //
-// Password is passed in, used once, and must be zeroed by the caller after respond().
+// Cancel path:
+//   Call cancel() → emits completed(false) → delete
+//
+// Thread safety: single-threaded Qt+GLib event loop only.
 
 class AuthSession : public QObject
 {
@@ -22,10 +25,14 @@ class AuthSession : public QObject
 public:
     enum class State { Idle, Authenticating, Completed, Failed, Cancelled };
 
+    // identity: PolkitIdentity* — AuthSession does NOT take ownership (no extra ref).
+    //           polkit_agent_session_new() will ref it internally.
+    // cancellable: g_object_ref'd internally.
+    // asyncCallback / asyncUserData: passed back to polkitd via GTask on completion.
     explicit AuthSession(const QString &cookie,
-                         void          *polkitIdentity, // PolkitIdentity*
+                         void          *identity,
                          GCancellable  *cancellable,
-                         void          *asyncCallback,  // GAsyncReadyCallback
+                         void          *asyncCallback,
                          void          *asyncUserData,
                          QObject       *parent = nullptr);
     ~AuthSession() override;
@@ -34,34 +41,28 @@ public:
     State   state()  const { return m_state; }
 
     void start();
-    void respond(const QString &password); // password zeroed internally after use
+    void respond(const QString &password); // zeros QByteArray buffer after PAM response
     void cancel();
 
 signals:
     void showError(const QString &text);
     void showInfo(const QString &text);
-    void requestPassword();             // polkit wants a password
-    void completed(bool gainedAuth);    // session done
+    void requestPassword();          // polkit PAM is asking for a password
+    void completed(bool gainedAuth); // session finished (success, failure, or cancel)
 
 private:
-    static void onRequest(PolkitAgentSession *session,
-                          const char         *request,
-                          gboolean            echoOn,
-                          void               *userData);
-    static void onShowError(PolkitAgentSession *session,
-                            const char         *text,
-                            void               *userData);
-    static void onShowInfo(PolkitAgentSession *session,
-                           const char         *text,
-                           void               *userData);
-    static void onCompleted(PolkitAgentSession *session,
-                            gboolean            gainedAuth,
-                            void               *userData);
+    // GLib signal callbacks — fire on Qt main thread (via QEventDispatcherGlib)
+    static void onRequest  (PolkitAgentSession *, const char *req, gboolean echo, void *ud);
+    static void onShowError(PolkitAgentSession *, const char *text, void *ud);
+    static void onShowInfo (PolkitAgentSession *, const char *text, void *ud);
+    static void onCompleted(PolkitAgentSession *, gboolean gainedAuth, void *ud);
 
-    QString          m_cookie;
-    State            m_state = State::Idle;
-    PolkitAgentSession *m_session = nullptr;
-    GCancellable     *m_cancellable = nullptr;
-    void             *m_asyncCallback = nullptr;
-    void             *m_asyncUserData = nullptr;
+    void completeTask(bool success, const char *errorMsg = nullptr);
+
+    QString             m_cookie;
+    State               m_state      = State::Idle;
+    PolkitAgentSession *m_session    = nullptr;
+    GCancellable       *m_cancellable = nullptr;
+    void               *m_asyncCallback = nullptr;
+    void               *m_asyncUserData = nullptr;
 };

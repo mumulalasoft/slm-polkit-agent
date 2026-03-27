@@ -4,7 +4,32 @@
 #include "dbus/agentnotifier.h"
 
 #include <QDebug>
+
 #include <polkit/polkit.h>
+#include <gio/gio.h>
+#include <pwd.h>
+#include <grp.h>
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+static QString resolveIdentityName(void *identity)
+{
+    if (POLKIT_IS_UNIX_USER(identity)) {
+        uid_t uid = polkit_unix_user_get_uid(POLKIT_UNIX_USER(identity));
+        if (struct passwd *pw = getpwuid(uid))
+            return QString::fromLocal8Bit(pw->pw_name);
+        return QStringLiteral("uid:%1").arg(uid);
+    }
+    if (POLKIT_IS_UNIX_GROUP(identity)) {
+        gid_t gid = polkit_unix_group_get_gid(POLKIT_UNIX_GROUP(identity));
+        if (struct group *gr = getgrgid(gid))
+            return QString::fromLocal8Bit(gr->gr_name);
+        return QStringLiteral("gid:%1").arg(gid);
+    }
+    return QStringLiteral("Unknown");
+}
+
+// ── AuthSessionManager ─────────────────────────────────────────────────────
 
 AuthSessionManager::AuthSessionManager(AuthDialogController *controller,
                                        AgentNotifier        *notifier,
@@ -25,6 +50,12 @@ AuthSessionManager::AuthSessionManager(AuthDialogController *controller,
 
 AuthSessionManager::~AuthSessionManager()
 {
+    // Unref GObjects for any queued requests that were never started.
+    while (!m_queue.isEmpty()) {
+        PendingRequest req = m_queue.dequeue();
+        if (req.identity)    g_object_unref(req.identity);
+        if (req.cancellable) g_object_unref(req.cancellable);
+    }
     delete m_current;
 }
 
@@ -37,59 +68,87 @@ void AuthSessionManager::initiateAuthentication(const QString &actionId,
                                                 void          *asyncCallback,
                                                 void          *asyncUserData)
 {
-    PendingRequest req{ actionId, message, iconName, cookie,
-                        identities, cancellable, asyncCallback, asyncUserData };
+    // Validate identities immediately — GList is only valid during this call.
+    if (!identities || !identities->data) {
+        qWarning("Auth request with no identities — failing immediately.");
+        failRequest(asyncCallback, asyncUserData, cancellable,
+                    "No identities provided by polkitd");
+        return;
+    }
+
+    // Extract the first identity. g_object_ref so it survives queuing.
+    void *identity = g_object_ref(G_OBJECT(identities->data));
+    const QString identityName = resolveIdentityName(identity);
+
+    PendingRequest req{
+        actionId, message, iconName, cookie,
+        identityName,
+        identity,
+        cancellable ? G_CANCELLABLE(g_object_ref(cancellable)) : nullptr,
+        asyncCallback,
+        asyncUserData
+    };
 
     if (m_current) {
         m_queue.enqueue(req);
-        qDebug() << "Auth request queued. Queue size:" << m_queue.size();
+        qDebug() << "Auth request queued for" << identityName
+                 << "— queue size:" << m_queue.size();
     } else {
         startRequest(req);
     }
 }
 
-void AuthSessionManager::startRequest(const PendingRequest &req)
+void AuthSessionManager::startRequest(PendingRequest &req)
 {
-    // Pick the first identity (typically the local user or admin)
-    void *identity = req.identities ? req.identities->data : nullptr;
-    if (!identity) {
-        qWarning() << "Auth request with no identities — aborting";
-        return;
-    }
-
-    // Resolve display name for the identity
-    QString identityName;
-    if (polkit_identity_get_user_name(POLKIT_IDENTITY(identity))) {
-        identityName = QString::fromUtf8(
-            polkit_identity_get_user_name(POLKIT_IDENTITY(identity)));
-    }
-
-    m_current = new AuthSession(req.cookie, identity, req.cancellable,
+    m_current = new AuthSession(req.cookie, req.identity, req.cancellable,
                                 req.asyncCallback, req.asyncUserData, this);
+
+    // AuthSession now has its own refs (polkit_agent_session_new refs identity;
+    // AuthSession constructor refs cancellable). Release our copies.
+    g_object_unref(req.identity);
+    req.identity = nullptr;
+    if (req.cancellable) {
+        g_object_unref(req.cancellable);
+        req.cancellable = nullptr;
+    }
+
     connect(m_current, &AuthSession::completed,
             this, &AuthSessionManager::onSessionCompleted);
-    connect(m_current, &AuthSession::showError, m_controller,
-            &AuthDialogController::setError);
-    connect(m_current, &AuthSession::showInfo,  m_controller,
-            &AuthDialogController::setInfo);
-    connect(m_current, &AuthSession::requestPassword, m_controller,
-            &AuthDialogController::showPasswordPrompt);
+    connect(m_current, &AuthSession::showError,
+            m_controller, &AuthDialogController::setError);
+    connect(m_current, &AuthSession::showInfo,
+            m_controller, &AuthDialogController::setInfo);
+    connect(m_current, &AuthSession::requestPassword,
+            m_controller, &AuthDialogController::showPasswordPrompt);
 
-    m_controller->presentRequest(req.actionId, req.message, req.iconName, identityName);
+    m_controller->presentRequest(req.actionId, req.message,
+                                 req.iconName, req.identityName);
     m_notifier->setAuthDialogActive(true);
     m_timeout->start(kTimeoutSeconds * 1000);
     m_current->start();
 }
 
-void AuthSessionManager::onSessionCompleted(bool gainedAuth)
+void AuthSessionManager::failRequest(void *asyncCallback, void *asyncUserData,
+                                     GCancellable *cancellable, const char *reason)
 {
-    Q_UNUSED(gainedAuth)
+    GTask *task = g_task_new(nullptr, cancellable,
+                             reinterpret_cast<GAsyncReadyCallback>(asyncCallback),
+                             asyncUserData);
+    g_task_return_error(task,
+        g_error_new(POLKIT_ERROR, POLKIT_ERROR_FAILED, "%s", reason));
+    g_object_unref(task);
+}
+
+// ── Slots ──────────────────────────────────────────────────────────────────
+
+void AuthSessionManager::onSessionCompleted(bool /*gainedAuth*/)
+{
     finishCurrent();
 }
 
 void AuthSessionManager::onTimeout()
 {
-    qWarning() << "Auth session timed out";
+    qWarning("Auth session timed out after %d seconds.", kTimeoutSeconds);
     if (m_current)
         m_current->cancel();
 }
@@ -109,12 +168,15 @@ void AuthSessionManager::onUserCancel()
 void AuthSessionManager::finishCurrent()
 {
     m_timeout->stop();
+
     delete m_current;
     m_current = nullptr;
 
     m_controller->hide();
     m_notifier->setAuthDialogActive(false);
 
-    if (!m_queue.isEmpty())
-        startRequest(m_queue.dequeue());
+    if (!m_queue.isEmpty()) {
+        PendingRequest req = m_queue.dequeue();
+        startRequest(req);
+    }
 }

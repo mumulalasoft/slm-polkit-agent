@@ -1,5 +1,7 @@
 set(AGENT_SOURCES
     src/main.cpp
+    src/iconprovider.cpp
+    src/iconprovider.h
     src/slmpolkitagent.cpp
     src/slmpolkitagent.h
     src/authsessionmanager.cpp

@@ -11,18 +11,21 @@ class AgentNotifier;
 typedef struct _GList        GList;
 typedef struct _GCancellable GCancellable;
 
-// AuthSessionManager — owns the queue of authentication requests.
+// AuthSessionManager — serializes polkit authentication requests.
 //
-// Polkit may deliver multiple InitiateAuthentication calls concurrently.
-// This manager ensures only one dialog is shown at a time; the rest wait.
+// polkitd can issue multiple concurrent InitiateAuthentication calls.
+// This manager ensures only one dialog is shown at a time; extras are queued.
 //
-// Flow:
-//   polkitd → initiateAuthentication()
-//             → if idle: start immediately
-//             → if busy: enqueue, start when current finishes
+// Request lifecycle:
+//   initiateAuthentication() → [queue or start immediately]
+//   → startRequest() → AuthSession → dialog shown
+//   → user responds / cancels / timeout
+//   → finishCurrent() → next in queue (if any)
 //
-// Each request has a per-session timeout. If the user does not respond
-// within the timeout, the session is auto-cancelled.
+// GLib ownership rules:
+//   - Each PendingRequest holds a g_object_ref'd identity and cancellable.
+//   - These are unref'd in startRequest() (after passing to AuthSession) or
+//     in the destructor for queued-but-never-started requests.
 
 class AuthSessionManager : public QObject
 {
@@ -36,7 +39,8 @@ public:
                                 QObject              *parent = nullptr);
     ~AuthSessionManager() override;
 
-    // Called from SlmPolkitAgent GObject callback — queues or starts immediately.
+    // Entry point from SlmPolkitAgent GObject callback.
+    // identities: GList of PolkitIdentity* — valid only for the duration of this call.
     void initiateAuthentication(const QString &actionId,
                                 const QString &message,
                                 const QString &iconName,
@@ -58,15 +62,17 @@ private:
         QString message;
         QString iconName;
         QString cookie;
-        GList   *identities;
-        GCancellable *cancellable;
-        void    *asyncCallback;
-        void    *asyncUserData;
+        QString identityName;    // resolved at enqueue time
+        void   *identity;        // g_object_ref'd PolkitIdentity — unref after use
+        GCancellable *cancellable; // g_object_ref'd — unref after use
+        void   *asyncCallback;
+        void   *asyncUserData;
     };
 
-    void startNext();
-    void startRequest(const PendingRequest &req);
+    void startRequest(PendingRequest &req);
     void finishCurrent();
+    void failRequest(void *asyncCallback, void *asyncUserData,
+                     GCancellable *cancellable, const char *reason);
 
     AuthDialogController *m_controller;
     AgentNotifier        *m_notifier;
