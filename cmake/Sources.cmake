@@ -1,0 +1,19 @@
+set(AGENT_SOURCES
+    src/main.cpp
+    src/slmpolkitagent.cpp
+    src/slmpolkitagent.h
+    src/authsessionmanager.cpp
+    src/authsessionmanager.h
+    src/authsession.cpp
+    src/authsession.h
+    src/authdialogcontroller.cpp
+    src/authdialogcontroller.h
+    src/dbus/agentnotifier.cpp
+    src/dbus/agentnotifier.h
+)
+
+set(AGENT_QML_FILES
+    Qml/polkit-agent/AuthDialog.qml
+    Qml/polkit-agent/PasswordField.qml
+    Qml/polkit-agent/AuthIdentityView.qml
+)

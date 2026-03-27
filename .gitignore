@@ -1,0 +1,15 @@
+build/
+.cache/
+.cmake/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.a
+*.so
+*.so.*
+moc_*.cpp
+qrc_*.cpp
+*.autosave
+.DS_Store

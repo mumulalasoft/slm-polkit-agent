@@ -1,0 +1,20 @@
+[Unit]
+Description=SLM Desktop Polkit Authentication Agent
+Documentation=https://github.com/mumulalasoft/slm-polkit-agent
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/slm-polkit-agent
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=5s
+# Security: no new privileges, restrict system calls
+NoNewPrivileges=true
+# Do not allow writing to /home or /tmp beyond what Qt needs
+PrivateTmp=false
+
+[Install]
+WantedBy=graphical-session.target
